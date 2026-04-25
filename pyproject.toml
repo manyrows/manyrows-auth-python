@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manyrows"
+version = "1.0.0"
+description = "Official Python SDK for the ManyRows Server API"
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "ManyRows" }]
+keywords = ["manyrows", "auth", "rbac", "feature-flags", "user-management", "sdk"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = ["httpx>=0.24,<1"]
+
+[project.urls]
+Homepage = "https://manyrows.com"
+Repository = "https://github.com/manyrows/manyrows-python"
+Issues = "https://github.com/manyrows/manyrows-python/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "pytest-asyncio>=0.21",
+  "ruff>=0.1",
+  "mypy>=1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manyrows"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/manyrows", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+files = ["src/manyrows"]
