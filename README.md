@@ -341,8 +341,8 @@ async def login(body: LoginBody, request: Request):
 
 ## Popup-aware OAuth callback HTML
 
-AppKit's bffMode opens Apple/Microsoft/GitHub sign-in in a popup. After
-ManyRows redirects the popup to your `/auth/oauth/callback?code=...`,
+AppKit (in BFF mode) opens Apple/Microsoft/GitHub sign-in in a popup.
+After ManyRows redirects the popup to your `/auth/oauth/callback?code=...`,
 your handler must serve a specific HTML page that postMessages the
 opener (or, when there's no opener, redirects the current tab):
 

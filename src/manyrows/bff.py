@@ -5,8 +5,9 @@ popup-aware OAuth callback HTML. Python web frameworks are too varied
 (Flask vs. FastAPI vs. Django vs. Starlette vs. raw WSGI) to ship a
 router-mount helper; this module provides the typed HTTP calls + the
 popup HTML + public proxies — the irreducible pieces a Python backend
-needs to stand up against AppKit's bffMode. Customers wire the routes
-themselves with their framework.
+needs to stand up against AppKit when BFF mode is enabled in the
+ManyRows admin. Customers wire the routes themselves with their
+framework.
 """
 
 from __future__ import annotations
@@ -686,9 +687,12 @@ class PublicProxy:
     Two patterns:
 
     - GET ``/apps/{appId}`` → ``/x/{workspace_slug}/apps/{appId}`` (public
-      boot — auth methods, branding, OAuth client IDs)
+      app config — kept here for tooling parity; AppKit now fetches this
+      directly from ManyRows via CORS, so wiring this proxy on your
+      backend is optional)
     - GET|POST ``/apps/{appId}/auth/*`` → pre-login auth surface (OAuth
-      authorize, OTP request, etc.)
+      authorize, OTP request, etc.) — AppKit hits these on your origin
+      so they MUST be wired
 
     Conceptually distinct from :class:`BffClient`: that calls authenticated
     server-to-server endpoints with HTTP Basic; this just relays browser
@@ -728,7 +732,13 @@ class PublicProxy:
             self._http = None
 
     def app_boot_get(self, app_id: str) -> ProxyResponse:
-        """GET /x/{workspace_slug}/apps/{app_id}. AppKit's bootstrap fetch."""
+        """GET /x/{workspace_slug}/apps/{app_id}. The public app-config endpoint.
+
+        AppKit fetches this directly from ManyRows via CORS to discover
+        whether BFF mode is enabled — your backend doesn't need to proxy
+        it. Provided here for tooling that wants the same config
+        server-side.
+        """
         if not app_id:
             raise ValueError("manyrows: app_id is required")
         url = f"{self._base_url}/x/{self._workspace_slug}/apps/{app_id}"
