@@ -427,6 +427,35 @@ client = Client(
 
 When you pass your own client, you own its lifecycle — call `http.close()` (or use it as a context manager) yourself.
 
+## Webhook verification
+
+ManyRows signs every outbound webhook delivery. Use `verify_webhook`
+on your receiver:
+
+```python
+from manyrows import verify_webhook, WebhookError
+from fastapi import FastAPI, Request, HTTPException
+
+app = FastAPI()
+
+@app.post("/webhooks/manyrows")
+async def webhook(request: Request):
+    body = await request.body()  # raw bytes — not request.json()
+    try:
+        verify_webhook(secret=secret, headers=request.headers, body=body)
+    except WebhookError as err:
+        raise HTTPException(401, detail=err.code)
+    # body is verified — json.loads(body) and process
+    return {"ok": True}
+```
+
+`verify_webhook` checks both the HMAC-SHA256 signature (over
+`<timestamp>.<body>`) and that `X-Webhook-Timestamp` is within
+±5 minutes of now. Pass `tolerance=timedelta(...)` to widen or tighten.
+
+Read the body as **raw bytes** before verifying — re-serializing
+parsed JSON changes whitespace and breaks the check.
+
 ## License
 
 [MIT](./LICENSE)

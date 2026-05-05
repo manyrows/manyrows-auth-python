@@ -32,6 +32,7 @@ from manyrows.client import (
     UserFieldValue,
     UserResult,
 )
+from manyrows.webhook import WebhookError, verify_webhook
 
 __all__ = [
     "AsyncBffClient",
@@ -59,11 +60,13 @@ __all__ = [
     "UserField",
     "UserFieldValue",
     "UserResult",
+    "WebhookError",
     "bearer_token",
     "dispatch_oauth_callback",
     "dispatch_oauth_callback_async",
     "verify_token",
     "verify_token_async",
+    "verify_webhook",
 ]
 
 __version__ = "1.0.0"
