@@ -1,20 +1,185 @@
-"""Bearer-token verification for server-side auth.
+"""Local JWT verification against the install's JWKS, with cookie-mode
+fallback for browsers that hold the session in an HttpOnly cookie
+instead of a Bearer header. Mirrors ``manyrows-go/auth.Middleware``.
 
-Mirrors the Go SDK's ``auth.Middleware`` pattern: validate the user's JWT
-against the ManyRows ``/a/me`` endpoint, then return the authenticated
-user ID.
+Tokens are signed ES256. The verifier fetches
+``${base_url}/.well-known/jwks.json`` once on first verify, caches the
+keys in-process, and refetches on a kid mismatch (with a short
+cooldown to prevent thundering on a stream of bad kids).
 """
 
 from __future__ import annotations
 
+import json
+import time
+from threading import Lock
+from typing import Any
+
 import httpx
+import jwt
+from jwt.algorithms import ECAlgorithm
 
 _USER_AGENT = "manyrows-python-auth/1.0"
 
+# Mirrors manyrows-core's clientauth.AccessCookieName(). Duplicated here
+# rather than imported because manyrows-python doesn't depend on the
+# core repo. Keep in sync if the server-side name ever changes.
+_ACCESS_COOKIE_NAME = "mr_at"
 
-def _me_url(base_url: str, workspace_slug: str, app_id: str) -> str:
-    base = base_url.rstrip("/")
-    return f"{base}/x/{workspace_slug}/apps/{app_id}/a/me"
+# JWKS cache parameters. ``_TTL`` is how long a fetched JWKS is trusted
+# before a refetch on the next miss; ``_COOLDOWN`` rate-limits refetches
+# triggered by an unknown kid (so a stream of bad kids can't pin us
+# against the network).
+_TTL = 600.0  # 10 min
+_COOLDOWN = 30.0
+
+
+class _JWKSEntry:
+    __slots__ = ("keys", "fetched_at", "last_refetch_attempt")
+
+    def __init__(self, keys: dict[str, Any]) -> None:
+        self.keys = keys
+        now = time.monotonic()
+        self.fetched_at = now
+        self.last_refetch_attempt = now
+
+
+# Module-level cache keyed by JWKS URL. Lock guards mutations; HTTP
+# fetches happen *outside* the lock so concurrent verify_token calls
+# for different URLs don't serialise on each other.
+_jwks_cache: dict[str, _JWKSEntry] = {}
+_jwks_lock = Lock()
+
+
+def _jwks_url(base_url: str) -> str:
+    return f"{base_url.rstrip('/')}/.well-known/jwks.json"
+
+
+def _parse_jwks(data: Any) -> dict[str, Any]:
+    """Decode a JWKS payload into a {kid: cryptography_public_key} map.
+
+    Non-EC / non-P-256 / kid-less entries are skipped silently — a
+    future server that publishes mixed key types stays compatible.
+    """
+    if not isinstance(data, dict):
+        return {}
+    raw_keys = data.get("keys")
+    if not isinstance(raw_keys, list):
+        return {}
+    out: dict[str, Any] = {}
+    for jwk_dict in raw_keys:
+        if not isinstance(jwk_dict, dict):
+            continue
+        kid = jwk_dict.get("kid")
+        if not kid or jwk_dict.get("kty") != "EC" or jwk_dict.get("crv") != "P-256":
+            continue
+        try:
+            key = ECAlgorithm.from_jwk(json.dumps(jwk_dict))
+        except Exception:
+            continue
+        out[kid] = key
+    return out
+
+
+def _fetch_jwks_sync(url: str, http_client: httpx.Client | None) -> dict[str, Any]:
+    headers = {"User-Agent": _USER_AGENT}
+    if http_client is not None:
+        res = http_client.get(url, headers=headers)
+    else:
+        with httpx.Client(timeout=10.0) as c:
+            res = c.get(url, headers=headers)
+    res.raise_for_status()
+    return _parse_jwks(res.json())
+
+
+async def _fetch_jwks_async(url: str, http_client: httpx.AsyncClient | None) -> dict[str, Any]:
+    headers = {"User-Agent": _USER_AGENT}
+    if http_client is not None:
+        res = await http_client.get(url, headers=headers)
+    else:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            res = await c.get(url, headers=headers)
+    res.raise_for_status()
+    return _parse_jwks(res.json())
+
+
+def _peek_cached(url: str, kid: str) -> tuple[Any | None, bool]:
+    """Return ``(key, should_refetch)`` for the cached JWKS at ``url``.
+
+    ``key`` may be a usable key, a stale (but cached) fallback, or
+    ``None`` when nothing is cached. ``should_refetch`` is True when
+    the caller should hit the network — either no cache, or unknown
+    kid past cooldown, or TTL expired.
+    """
+    now = time.monotonic()
+    with _jwks_lock:
+        entry = _jwks_cache.get(url)
+        if entry is None:
+            return None, True
+        fresh = (now - entry.fetched_at) < _TTL
+        cached_key = entry.keys.get(kid)
+        if fresh and cached_key is not None:
+            return cached_key, False
+        # Either stale or unknown kid. Respect cooldown to avoid
+        # hammering the JWKS endpoint on a hostile token stream.
+        if (now - entry.last_refetch_attempt) < _COOLDOWN:
+            return cached_key, False
+        entry.last_refetch_attempt = now
+        return cached_key, True
+
+
+def _store_jwks(url: str, keys: dict[str, Any]) -> None:
+    with _jwks_lock:
+        _jwks_cache[url] = _JWKSEntry(keys)
+
+
+def _resolve_key_sync(base_url: str, kid: str, http_client: httpx.Client | None) -> Any | None:
+    url = _jwks_url(base_url)
+    cached, should_refetch = _peek_cached(url, kid)
+    if not should_refetch:
+        return cached
+    try:
+        keys = _fetch_jwks_sync(url, http_client)
+    except Exception:
+        # Fall back to whatever's cached (possibly stale, possibly
+        # missing) — better to keep authenticating users on the kids
+        # we already know than to hard-fail every request during a
+        # transient JWKS outage.
+        return cached
+    _store_jwks(url, keys)
+    return keys.get(kid)
+
+
+async def _resolve_key_async(
+    base_url: str, kid: str, http_client: httpx.AsyncClient | None
+) -> Any | None:
+    url = _jwks_url(base_url)
+    cached, should_refetch = _peek_cached(url, kid)
+    if not should_refetch:
+        return cached
+    try:
+        keys = await _fetch_jwks_async(url, http_client)
+    except Exception:
+        return cached
+    _store_jwks(url, keys)
+    return keys.get(kid)
+
+
+def _verify_with_key(token: str, key: Any) -> str | None:
+    try:
+        payload = jwt.decode(
+            token,
+            key,
+            algorithms=["ES256"],
+            leeway=60,
+            options={"verify_aud": False},
+        )
+    except jwt.PyJWTError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    sub = payload.get("sub")
+    return sub if isinstance(sub, str) and sub else None
 
 
 def verify_token(
@@ -25,44 +190,32 @@ def verify_token(
     app_id: str,
     http_client: httpx.Client | None = None,
 ) -> str | None:
-    """Verify a user's bearer token by calling the ManyRows ``/a/me`` endpoint.
+    """Verify a user's bearer JWT against the install's JWKS.
 
-    Returns the user ID on success.
-    Returns ``None`` if the token is empty or rejected by ManyRows (401/403).
-    Raises ``httpx.HTTPError`` on network errors or unexpected (5xx, malformed) responses.
+    Returns the user ID (``sub`` claim) on success.
+    Returns ``None`` if the token is empty, malformed, expired, or
+    fails signature verification — caller should treat as "not
+    authenticated" and 401 the request.
 
-    Callers in security-sensitive contexts should treat raised errors the same
-    as ``None`` — fail closed, don't let a flaky upstream become an auth bypass.
+    ``workspace_slug`` and ``app_id`` are accepted for source-compat
+    with the previous ``/a/me``-based API and forward-compat (e.g. a
+    future audience check); the local-verify path doesn't currently
+    use them.
     """
+    _ = workspace_slug, app_id
     if not token:
         return None
-
-    url = _me_url(base_url, workspace_slug, app_id)
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": _USER_AGENT}
-
-    if http_client is not None:
-        res = http_client.get(url, headers=headers)
-    else:
-        with httpx.Client(timeout=10.0) as c:
-            res = c.get(url, headers=headers)
-
-    if res.status_code in (401, 403):
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError:
         return None
-    if not res.is_success:
-        raise httpx.HTTPStatusError(
-            f"manyrows: /me returned {res.status_code}",
-            request=res.request,
-            response=res,
-        )
-
-    data = res.json()
-    if not isinstance(data, dict):
+    kid = header.get("kid") if isinstance(header, dict) else None
+    if not isinstance(kid, str) or not kid:
         return None
-    user = data.get("user")
-    if not isinstance(user, dict):
+    key = _resolve_key_sync(base_url, kid, http_client)
+    if key is None:
         return None
-    user_id = user.get("id")
-    return user_id if isinstance(user_id, str) and user_id else None
+    return _verify_with_key(token, key)
 
 
 async def verify_token_async(
@@ -73,36 +226,21 @@ async def verify_token_async(
     app_id: str,
     http_client: httpx.AsyncClient | None = None,
 ) -> str | None:
-    """Async equivalent of :func:`verify_token`."""
+    """Async equivalent of :func:`verify_token`. Same JWKS cache."""
+    _ = workspace_slug, app_id
     if not token:
         return None
-
-    url = _me_url(base_url, workspace_slug, app_id)
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": _USER_AGENT}
-
-    if http_client is not None:
-        res = await http_client.get(url, headers=headers)
-    else:
-        async with httpx.AsyncClient(timeout=10.0) as c:
-            res = await c.get(url, headers=headers)
-
-    if res.status_code in (401, 403):
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError:
         return None
-    if not res.is_success:
-        raise httpx.HTTPStatusError(
-            f"manyrows: /me returned {res.status_code}",
-            request=res.request,
-            response=res,
-        )
-
-    data = res.json()
-    if not isinstance(data, dict):
+    kid = header.get("kid") if isinstance(header, dict) else None
+    if not isinstance(kid, str) or not kid:
         return None
-    user = data.get("user")
-    if not isinstance(user, dict):
+    key = await _resolve_key_async(base_url, kid, http_client)
+    if key is None:
         return None
-    user_id = user.get("id")
-    return user_id if isinstance(user_id, str) and user_id else None
+    return _verify_with_key(token, key)
 
 
 def bearer_token(header_value: str | list[str] | None) -> str | None:
@@ -129,3 +267,40 @@ def bearer_token(header_value: str | list[str] | None) -> str | None:
         return None
     tok = trimmed[7:].strip()
     return tok if tok else None
+
+
+def mr_at_cookie(cookie_header_value: str | list[str] | None) -> str | None:
+    """Extract the ``mr_at`` session cookie from a Cookie header value.
+
+    Used as a fallback when the SDK is in cookie mode and no
+    Authorization header is present. Returns ``None`` when absent,
+    empty, or malformed. Accepts a list (joined into one cookie
+    string) for compatibility with frameworks that surface duplicate
+    headers.
+    """
+    if cookie_header_value is None:
+        return None
+    if isinstance(cookie_header_value, list):
+        if not cookie_header_value:
+            return None
+        cookie_header_value = "; ".join(cookie_header_value)
+    if not isinstance(cookie_header_value, str):
+        return None
+    for raw in cookie_header_value.split(";"):
+        eq = raw.find("=")
+        if eq < 0:
+            continue
+        name = raw[:eq].strip()
+        if name != _ACCESS_COOKIE_NAME:
+            continue
+        value = raw[eq + 1 :].strip()
+        return value if value else None
+    return None
+
+
+def reset_jwks_cache_for_test() -> None:
+    """Clear the in-process JWKS cache. Test seam — production code
+    should never call this.
+    """
+    with _jwks_lock:
+        _jwks_cache.clear()

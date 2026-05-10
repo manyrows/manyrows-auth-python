@@ -1,6 +1,6 @@
 """Official Python SDK for the ManyRows Server API."""
 
-from manyrows.auth import bearer_token, verify_token, verify_token_async
+from manyrows.auth import bearer_token, mr_at_cookie, verify_token, verify_token_async
 from manyrows.bff import (
     AsyncBffClient,
     AsyncPublicProxy,
@@ -68,6 +68,7 @@ __all__ = [
     "decrypt_secret",
     "dispatch_oauth_callback",
     "dispatch_oauth_callback_async",
+    "mr_at_cookie",
     "verify_token",
     "verify_token_async",
     "verify_webhook",

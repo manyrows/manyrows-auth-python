@@ -23,7 +23,10 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = ["httpx>=0.24,<1"]
+dependencies = [
+  "httpx>=0.24,<1",
+  "pyjwt[crypto]>=2.8",
+]
 
 [project.urls]
 Homepage = "https://manyrows.com"
