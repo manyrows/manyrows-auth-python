@@ -60,6 +60,38 @@ def _jwks_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/.well-known/jwks.json"
 
 
+def _require_secure_base_url(base_url: str) -> None:
+    """Reject base URLs that would make JWKS fetches MITM-able.
+
+    Only ``https://`` is accepted, with the usual localhost /
+    ``127.0.0.1`` / ``[::1]`` exceptions so dev loops don't force
+    operators into self-signed cert dances. Raises ``ValueError`` so
+    a misconfigured deploy fails on first verify rather than silently
+    accepting forged keys.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ValueError("manyrows auth: base_url is empty")
+    s = base_url.strip().lower()
+    if s.startswith("https://"):
+        return
+    for prefix in ("http://localhost", "http://127.0.0.1", "http://[::1]"):
+        if s.startswith(prefix):
+            return
+    raise ValueError(
+        f"manyrows auth: base_url must use https:// (got {base_url!r}) — "
+        "refusing to fetch JWKS over plaintext"
+    )
+
+
+def _iss_matches(claim: Any, expected: str) -> bool:
+    """Compare a JWT ``iss`` claim to the configured ``base_url``,
+    tolerating an optional trailing slash on either side.
+    """
+    if not isinstance(claim, str):
+        return False
+    return claim.rstrip("/") == expected.rstrip("/")
+
+
 def _parse_jwks(data: Any) -> dict[str, Any]:
     """Decode a JWKS payload into a {kid: cryptography_public_key} map.
 
@@ -170,7 +202,7 @@ async def _resolve_key_async(
     return keys.get(kid)
 
 
-def _verify_with_key(token: str, key: Any, app_id: str) -> str | None:
+def _verify_with_key(token: str, key: Any, app_id: str, base_url: str) -> str | None:
     try:
         # `audience=app_id` enforces that the token's aud claim contains
         # this app's ID — PyJWT accepts both string and list[str] shapes
@@ -186,6 +218,14 @@ def _verify_with_key(token: str, key: Any, app_id: str) -> str | None:
     except jwt.PyJWTError:
         return None
     if not isinstance(payload, dict):
+        return None
+    # iss check: defence-in-depth against cross-install token replay.
+    # The signature alone proves the token came from this install (it
+    # was signed with the install's private key), but if a signing key
+    # ever leaked across deployments — operator error, "promoted from
+    # staging," whatever — this catch surfaces it instead of silently
+    # accepting. Trailing-slash tolerant; see _iss_matches.
+    if not _iss_matches(payload.get("iss"), base_url):
         return None
     sub = payload.get("sub")
     return sub if isinstance(sub, str) and sub else None
@@ -213,6 +253,7 @@ def verify_token(
     forward-compat (e.g. a future per-workspace check).
     """
     _ = workspace_slug
+    _require_secure_base_url(base_url)
     if not token:
         return None
     try:
@@ -225,7 +266,7 @@ def verify_token(
     key = _resolve_key_sync(base_url, kid, http_client)
     if key is None:
         return None
-    return _verify_with_key(token, key, app_id)
+    return _verify_with_key(token, key, app_id, base_url)
 
 
 async def verify_token_async(
@@ -238,6 +279,7 @@ async def verify_token_async(
 ) -> str | None:
     """Async equivalent of :func:`verify_token`. Same JWKS cache."""
     _ = workspace_slug
+    _require_secure_base_url(base_url)
     if not token:
         return None
     try:
@@ -250,7 +292,7 @@ async def verify_token_async(
     key = await _resolve_key_async(base_url, kid, http_client)
     if key is None:
         return None
-    return _verify_with_key(token, key, app_id)
+    return _verify_with_key(token, key, app_id, base_url)
 
 
 def bearer_token(header_value: str | list[str] | None) -> str | None:

@@ -47,10 +47,22 @@ def _generate_keypair():
     return private_key, jwk, kid
 
 
-def _sign(private_key, kid: str, *, sub: str = "user_xyz", aud: str = "app_123", **claims) -> str:
+def _sign(
+    private_key,
+    kid: str,
+    *,
+    sub: str = "user_xyz",
+    aud: str = "app_123",
+    iss: str = "https://app.manyrows.com",
+    **claims,
+) -> str:
+    # iss defaults to VERIFY_OPTS["base_url"] so tokens round-trip through
+    # the SDK's iss validation. Tests exercising the iss-mismatch path
+    # pass an explicit iss override.
     payload = {
         "sub": sub,
         "aud": aud,
+        "iss": iss,
         "iat": int(time.time()),
         "exp": int(time.time()) + 300,
         **claims,
@@ -227,6 +239,45 @@ class TestVerifyTokenSync:
         assert (
             str(captured[0].url) == "https://app.manyrows.com/.well-known/jwks.json"
         )
+
+    def test_rejects_iss_mismatch(self):
+        priv, jwk, kid = _generate_keypair()
+        tok = _sign(priv, kid, iss="https://other-install.example.com")
+        with httpx.Client(transport=_jwks_transport({"keys": [jwk]})) as http:
+            assert verify_token(tok, **VERIFY_OPTS, http_client=http) is None
+
+    def test_tolerates_trailing_slash_on_iss(self):
+        priv, jwk, kid = _generate_keypair()
+        tok = _sign(priv, kid, iss="https://app.manyrows.com/")
+        with httpx.Client(transport=_jwks_transport({"keys": [jwk]})) as http:
+            assert verify_token(tok, **VERIFY_OPTS, http_client=http) == "user_xyz"
+
+    def test_rejects_plain_http_base_url(self):
+        # H5: plaintext JWKS fetches are MITM-able; refuse to even try.
+        with pytest.raises(ValueError, match="https"):
+            verify_token(
+                "any.token.value",
+                base_url="http://app.example.com",
+                workspace_slug="acme",
+                app_id="app_123",
+            )
+
+    def test_accepts_localhost_http_for_dev(self):
+        # Localhost loops are routinely plaintext; allow them so dev
+        # iterations don't need self-signed certs.
+        priv, jwk, kid = _generate_keypair()
+        tok = _sign(priv, kid, iss="http://localhost:8080")
+        with httpx.Client(transport=_jwks_transport({"keys": [jwk]})) as http:
+            assert (
+                verify_token(
+                    tok,
+                    base_url="http://localhost:8080",
+                    workspace_slug="acme",
+                    app_id="app_123",
+                    http_client=http,
+                )
+                == "user_xyz"
+            )
 
 
 # =====================================================================
