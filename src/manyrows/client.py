@@ -1,562 +1,573 @@
-"""ManyRows Server API client. Mirrors the surface of manyrows-go / manyrows-node."""
+"""Client for the ManyRows server-to-server API."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from types import TracebackType
-from typing import Any
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Optional
 
-import httpx
+from .models import (
+    CheckPermissionResult,
+    CreateUserResult,
+    Delivery,
+    MagicLinkResult,
+    MembersList,
+    PermissionSummary,
+    RemoveUserResult,
+    RoleSummary,
+    AuthLogsPage,
+    BatchUserResult,
+    ConfigKey,
+    FeatureFlag,
+    FeatureFlagOverride,
+    Identity,
+    Passkey,
+    ServerUser,
+    Session,
+    UserField,
+    UserFieldValue,
+    UserStatus,
+    Webhook,
+    from_dict,
+)
 
-_USER_AGENT = "manyrows-python/1.0"
 
+class ManyRowsServerError(Exception):
+    """Raised for any non-2xx response; carries the HTTP status and error code."""
 
-class ManyRowsError(Exception):
-    """Raised for any non-2xx response from the ManyRows API.
-
-    Inspect ``status`` and ``body`` to distinguish auth failures (401),
-    rate limits (429), server errors (5xx), etc.
-    """
-
-    def __init__(self, message: str, status: int | None = None, body: str | None = None):
-        super().__init__(message)
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message or code or f"HTTP {status}")
         self.status = status
-        self.body = body
-
-
-# ===== Delivery =====
-
-
-@dataclass
-class ConfigItem:
-    key: str
-    type: str
-    value: Any = None
-    is_set: bool | None = None
-    # For ``secrets`` only: the encrypted envelope, as returned by the
-    # server-API delivery endpoint. Pass to ``manyrows.secrets.decrypt_secret``
-    # along with your workspace private JWK to recover the plaintext.
-    # Only set when ``is_set`` is True.
-    envelope: dict[str, Any] | None = None
-
-
-@dataclass
-class FeatureFlag:
-    key: str
-    enabled: bool
-
-
-@dataclass
-class DeliveryConfig:
-    public: list[ConfigItem] = field(default_factory=list)
-    private: list[ConfigItem] = field(default_factory=list)
-    secrets: list[ConfigItem] = field(default_factory=list)
-
-
-@dataclass
-class DeliveryFlags:
-    client: list[FeatureFlag] = field(default_factory=list)
-    server: list[FeatureFlag] = field(default_factory=list)
-
-
-@dataclass
-class Delivery:
-    workspace_id: str
-    project_id: str
-    app_id: str
-    updated_at: str
-    config: DeliveryConfig
-    flags: DeliveryFlags
-
-
-# ===== Permissions =====
-
-
-@dataclass
-class PermissionResult:
-    allowed: bool
-    permission: str
-    account_id: str
-
-
-# ===== Members =====
-
-
-@dataclass
-class Member:
-    user_id: str
-    email: str
-    enabled: bool
-    source: str
-    added_at: str
-    roles: list[str] = field(default_factory=list)
-    name: str | None = None
-    email_verified_at: str | None = None
-    password_set_at: str | None = None
-    last_login_at: str | None = None
-
-
-@dataclass
-class MembersResult:
-    members: list[Member]
-    total: int
-    page: int
-    page_size: int
-
-
-# ===== Users =====
-
-
-@dataclass
-class User:
-    id: str
-    email: str
-    enabled: bool
-    source: str
-    email_verified_at: str | None = None
-    password_set_at: str | None = None
-    totp_enabled: bool | None = None
-
-
-@dataclass
-class UserFieldValue:
-    id: str
-    user_field_id: str
-    value: Any
-    updated_at: str
-    project_id: str | None = None
-    user_id: str | None = None
-    updated_by: str | None = None
-
-
-@dataclass
-class UserResult:
-    user: User
-    roles: list[str] = field(default_factory=list)
-    permissions: list[str] = field(default_factory=list)
-    fields: list[UserFieldValue] = field(default_factory=list)
-
-
-# ===== User Fields =====
-
-
-@dataclass
-class UserField:
-    id: str
-    key: str
-    value_type: str
-    status: str
-    label: str | None = None
-    visibility: str | None = None
-
-
-# ===== Parsers (camelCase wire format -> snake_case dataclasses) =====
-
-
-def _parse_config_item(d: dict[str, Any]) -> ConfigItem:
-    return ConfigItem(
-        key=d["key"],
-        type=d["type"],
-        value=d.get("value"),
-        is_set=d.get("isSet"),
-        envelope=d.get("envelope"),
-    )
-
-
-def _parse_feature_flag(d: dict[str, Any]) -> FeatureFlag:
-    return FeatureFlag(key=d["key"], enabled=d["enabled"])
-
-
-def _parse_delivery(d: dict[str, Any]) -> Delivery:
-    cfg = d.get("config") or {}
-    flags = d.get("flags") or {}
-    return Delivery(
-        workspace_id=d["workspaceId"],
-        project_id=d["projectId"],
-        app_id=d["appId"],
-        updated_at=d["updatedAt"],
-        config=DeliveryConfig(
-            public=[_parse_config_item(c) for c in cfg.get("public") or []],
-            private=[_parse_config_item(c) for c in cfg.get("private") or []],
-            secrets=[_parse_config_item(c) for c in cfg.get("secrets") or []],
-        ),
-        flags=DeliveryFlags(
-            client=[_parse_feature_flag(f) for f in flags.get("client") or []],
-            server=[_parse_feature_flag(f) for f in flags.get("server") or []],
-        ),
-    )
-
-
-def _parse_permission_result(d: dict[str, Any]) -> PermissionResult:
-    return PermissionResult(
-        allowed=bool(d.get("allowed")),
-        permission=d.get("permission", ""),
-        account_id=d.get("accountId", ""),
-    )
-
-
-def _parse_member(d: dict[str, Any]) -> Member:
-    return Member(
-        user_id=d["userId"],
-        email=d["email"],
-        enabled=bool(d.get("enabled", True)),
-        source=d.get("source", ""),
-        added_at=d.get("addedAt", ""),
-        roles=list(d.get("roles") or []),
-        name=d.get("name"),
-        email_verified_at=d.get("emailVerifiedAt"),
-        password_set_at=d.get("passwordSetAt"),
-        last_login_at=d.get("lastLoginAt"),
-    )
-
-
-def _parse_members_result(d: dict[str, Any]) -> MembersResult:
-    return MembersResult(
-        members=[_parse_member(m) for m in d.get("members") or []],
-        total=int(d.get("total", 0)),
-        page=int(d.get("page", 0)),
-        page_size=int(d.get("pageSize", 0)),
-    )
-
-
-def _parse_user(d: dict[str, Any]) -> User:
-    return User(
-        id=d["id"],
-        email=d["email"],
-        enabled=bool(d.get("enabled", True)),
-        source=d.get("source", ""),
-        email_verified_at=d.get("emailVerifiedAt"),
-        password_set_at=d.get("passwordSetAt"),
-        totp_enabled=d.get("totpEnabled"),
-    )
-
-
-def _parse_user_field_value(d: dict[str, Any]) -> UserFieldValue:
-    return UserFieldValue(
-        id=d["id"],
-        user_field_id=d["userFieldId"],
-        value=d.get("value"),
-        updated_at=d.get("updatedAt", ""),
-        project_id=d.get("projectId"),
-        user_id=d.get("userId"),
-        updated_by=d.get("updatedBy"),
-    )
-
-
-def _parse_user_result(d: dict[str, Any]) -> UserResult:
-    return UserResult(
-        user=_parse_user(d["user"]),
-        roles=list(d.get("roles") or []),
-        permissions=list(d.get("permissions") or []),
-        fields=[_parse_user_field_value(f) for f in d.get("fields") or []],
-    )
-
-
-def _parse_user_field(d: dict[str, Any]) -> UserField:
-    return UserField(
-        id=d["id"],
-        key=d["key"],
-        value_type=d["valueType"],
-        status=d["status"],
-        label=d.get("label"),
-        visibility=d.get("visibility"),
-    )
-
-
-# ===== Sync Client =====
-
-
-def _validate_opts(base_url: str, workspace_slug: str, app_id: str, api_key: str) -> None:
-    if not base_url:
-        raise ValueError("manyrows: base_url is required")
-    if not workspace_slug:
-        raise ValueError("manyrows: workspace_slug is required")
-    if not app_id:
-        raise ValueError("manyrows: app_id is required")
-    if not api_key:
-        raise ValueError("manyrows: api_key is required")
-
-
-def _strip_trailing_slashes(s: str) -> str:
-    return s.rstrip("/")
-
-
-def _raise_for_status(res: httpx.Response) -> None:
-    if not res.is_success:
-        body = res.text
-        raise ManyRowsError(
-            f"manyrows: {body or res.reason_phrase} (status {res.status_code})",
-            status=res.status_code,
-            body=body,
-        )
-
-
-class Client:
-    """Synchronous client for the ManyRows Server API.
-
-    Construct once and reuse; the underlying ``httpx.Client`` pools connections.
-    Supports use as a context manager:
-
-        with Client(...) as c:
-            user = c.get_user("u_1")
+        self.code = code
+        self.message = message or code
+
+
+class ManyRowsServer:
+    """Typed client for one app's server-to-server API.
+
+    >>> mr = ManyRowsServer(
+    ...     base_url="https://auth.example.com",
+    ...     workspace="acme",
+    ...     app_id="3f2a…",
+    ...     api_key=os.environ["MANYROWS_API_KEY"],
+    ... )
+    >>> mr.check_permission(user_id, "posts:read").allowed
     """
 
     def __init__(
         self,
+        *,
         base_url: str,
-        workspace_slug: str,
+        workspace: str,
         app_id: str,
         api_key: str,
-        *,
-        http_client: httpx.Client | None = None,
+        timeout: float = 30.0,
     ):
-        _validate_opts(base_url, workspace_slug, app_id, api_key)
+        if not base_url:
+            raise ValueError("ManyRowsServer: base_url is required")
+        if not workspace:
+            raise ValueError("ManyRowsServer: workspace is required")
+        if not app_id:
+            raise ValueError("ManyRowsServer: app_id is required")
+        if not api_key:
+            raise ValueError("ManyRowsServer: api_key is required")
 
-        self._base_url = _strip_trailing_slashes(base_url)
-        self._workspace_slug = workspace_slug
-        self._app_id = app_id
+        root = base_url.rstrip("/")
+        ws = urllib.parse.quote(workspace, safe="")
+        app = urllib.parse.quote(app_id, safe="")
+        self._base = f"{root}/x/{ws}/api/v1/apps/{app}"
         self._api_key = api_key
-        self._owns_http = http_client is None
-        self._http = http_client if http_client is not None else httpx.Client(timeout=10.0)
+        self._timeout = timeout
 
-    def _api_url(self, path: str) -> str:
-        return (
-            f"{self._base_url}/x/{self._workspace_slug}/api/apps/{self._app_id}{path}"
-        )
-
-    def _get_json(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        try:
-            res = self._http.get(
-                url,
-                params=params,
-                headers={"X-API-Key": self._api_key, "User-Agent": _USER_AGENT},
-            )
-        except httpx.HTTPError as exc:
-            raise ManyRowsError(f"manyrows: request failed: {exc}") from exc
-
-        _raise_for_status(res)
-
-        try:
-            data = res.json()
-        except ValueError as exc:
-            raise ManyRowsError(f"manyrows: failed to decode response: {exc}") from exc
-
-        if not isinstance(data, dict):
-            raise ManyRowsError("manyrows: unexpected response shape (not an object)")
-        return data
-
-    # === Lifecycle ===
-
-    def close(self) -> None:
-        if self._owns_http:
-            self._http.close()
-
-    def __enter__(self) -> Client:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.close()
-
-    # === Delivery ===
+    # ---- Delivery ----
 
     def get_delivery(self) -> Delivery:
-        """Returns config keys + feature flags for this app."""
-        return _parse_delivery(self._get_json(self._api_url("/")))
+        """All config values and feature flags for the app."""
+        return from_dict(Delivery, self._request("GET", "/"))
 
-    # === Permissions ===
+    # ---- Authorization ----
 
-    def check_permission(self, account_id: str, permission: str) -> PermissionResult:
-        """Checks whether a user has a specific permission."""
-        return _parse_permission_result(
-            self._get_json(
-                self._api_url("/check-permission"),
-                params={"accountId": account_id, "permission": permission},
-            )
-        )
+    def check_permission(self, user_id: str, permission: str) -> CheckPermissionResult:
+        """Whether a member has a permission in this app."""
+        data = self._request("GET", "/check-permission", query={"accountId": user_id, "permission": permission})
+        return from_dict(CheckPermissionResult, data)
 
-    def has_permission(self, account_id: str, permission: str) -> bool:
-        """Convenience: returns just the boolean from ``check_permission``."""
-        return self.check_permission(account_id, permission).allowed
+    def list_roles(self) -> list[RoleSummary]:
+        """The product's roles, each with the permission slugs it grants."""
+        data = self._request("GET", "/roles")
+        return [from_dict(RoleSummary, r) for r in data.get("roles", [])]
 
-    # === Members ===
+    def get_role(self, slug: str) -> RoleSummary:
+        """Fetch one role (with its permission slugs) by slug."""
+        return from_dict(RoleSummary, self._request("GET", f"/roles/{urllib.parse.quote(slug, safe='')}"))
 
-    def list_members(
+    def list_permissions(self) -> list[PermissionSummary]:
+        """The product's permissions."""
+        data = self._request("GET", "/permissions")
+        return [from_dict(PermissionSummary, p) for p in data.get("permissions", [])]
+
+    def get_permission(self, slug: str) -> PermissionSummary:
+        """Fetch one permission by slug."""
+        return from_dict(PermissionSummary, self._request("GET", f"/permissions/{urllib.parse.quote(slug, safe='')}"))
+
+    def create_role(self, *, slug: str, name: str, permissions: Optional[list[str]] = None) -> RoleSummary:
+        """Define a new role, optionally with permission slugs."""
+        body: dict[str, Any] = {"slug": slug, "name": name}
+        if permissions is not None:
+            body["permissions"] = permissions
+        return from_dict(RoleSummary, self._request("POST", "/roles", body=body))
+
+    def update_role(
+        self, slug: str, *, name: Optional[str] = None, permissions: Optional[list[str]] = None
+    ) -> RoleSummary:
+        """Update a role's name and/or permissions (omit a field to leave it unchanged)."""
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if permissions is not None:
+            body["permissions"] = permissions
+        return from_dict(RoleSummary, self._request("PATCH", f"/roles/{urllib.parse.quote(slug, safe='')}", body=body))
+
+    def delete_role(self, slug: str) -> None:
+        """Delete a role."""
+        self._request("DELETE", f"/roles/{urllib.parse.quote(slug, safe='')}")
+
+    def create_permission(self, *, slug: str, name: str) -> PermissionSummary:
+        """Define a new permission."""
+        return from_dict(PermissionSummary, self._request("POST", "/permissions", body={"slug": slug, "name": name}))
+
+    def update_permission(self, slug: str, name: str) -> PermissionSummary:
+        """Rename a permission."""
+        data = self._request("PATCH", f"/permissions/{urllib.parse.quote(slug, safe='')}", body={"name": name})
+        return from_dict(PermissionSummary, data)
+
+    def delete_permission(self, slug: str) -> None:
+        """Delete a permission."""
+        self._request("DELETE", f"/permissions/{urllib.parse.quote(slug, safe='')}")
+
+    # ---- Users ----
+
+    def list_users(
+        self, *, search: Optional[str] = None, page: Optional[int] = None, page_size: Optional[int] = None
+    ) -> MembersList:
+        """List the app's members (``search`` is an email substring filter)."""
+        query: dict[str, Any] = {}
+        if search:
+            query["search"] = search
+        if page:
+            query["page"] = page
+        if page_size:
+            query["pageSize"] = page_size
+        return from_dict(MembersList, self._request("GET", "/users", query=query))
+
+    def get_user_by_email(self, email: str) -> ServerUser:
+        """Look up a member by exact email."""
+        return from_dict(ServerUser, self._request("GET", "/users", query={"email": email}))
+
+    def get_user(self, user_id: str) -> ServerUser:
+        """Fetch a member by id."""
+        return from_dict(ServerUser, self._request("GET", f"/users/{urllib.parse.quote(user_id, safe='')}"))
+
+    def create_user(
         self,
-        page: int = 0,
-        page_size: int = 50,
-        email: str | None = None,
-    ) -> MembersResult:
-        """Returns paginated members for the app. Pass ``email`` to filter (substring match)."""
-        params: dict[str, Any] = {"page": page, "pageSize": page_size}
-        if email:
-            params["email"] = email
-        return _parse_members_result(self._get_json(self._api_url("/members"), params=params))
+        *,
+        email: str,
+        email_verified: bool = False,
+        roles: Optional[list[str]] = None,
+        send_invite: bool = False,
+    ) -> CreateUserResult:
+        """Provision a user: create-or-find by email in the pool and add to the app. Idempotent.
 
-    def list_members_by_email(
-        self, email: str, page: int = 0, page_size: int = 50
-    ) -> MembersResult:
-        """Convenience for ``list_members(email=..., page=..., page_size=...)``."""
-        return self.list_members(page=page, page_size=page_size, email=email)
+        Set ``send_invite=True`` to email the user a branded invitation
+        (requires the app to have an App URL configured).
+        """
+        body: dict[str, Any] = {"email": email}
+        if email_verified:
+            body["emailVerified"] = True
+        if roles is not None:
+            body["roles"] = roles
+        if send_invite:
+            body["sendInvite"] = True
+        return from_dict(CreateUserResult, self._request("POST", "/users", body=body))
 
-    # === Users ===
+    def batch_create_users(
+        self, emails: list[str], *, email_verified: bool = False, roles: Optional[list[str]] = None
+    ) -> list[BatchUserResult]:
+        """Provision up to 100 users at once, all with the same optional roles.
 
-    def get_user(self, user_id: str) -> UserResult:
-        """Look up a user by ID."""
-        return _parse_user_result(
-            self._get_json(self._api_url("/users"), params={"id": user_id})
+        Each email is reported independently, so one bad email doesn't sink the
+        rest. Idempotent per email.
+        """
+        body: dict[str, Any] = {"emails": emails}
+        if email_verified:
+            body["emailVerified"] = True
+        if roles is not None:
+            body["roles"] = roles
+        data = self._request("POST", "/users:batch", body=body)
+        return [from_dict(BatchUserResult, item) for item in data.get("results", [])]
+
+    def set_user_status(self, user_id: str, status: str) -> UserStatus:
+        """Suspend (``"disabled"``) or re-enable (``"active"``) a member in this app."""
+        data = self._request("PATCH", f"/users/{urllib.parse.quote(user_id, safe='')}", body={"status": status})
+        return from_dict(UserStatus, data)
+
+    def remove_user(self, user_id: str) -> RemoveUserResult:
+        """Remove a member from the app; prunes the pool identity if left in no other app."""
+        return from_dict(RemoveUserResult, self._request("DELETE", f"/users/{urllib.parse.quote(user_id, safe='')}"))
+
+    def replace_user_roles(self, user_id: str, roles: list[str]) -> list[str]:
+        """Replace a member's roles (full set of slugs; ``[]`` clears them and revokes sessions)."""
+        data = self._request(
+            "PUT", f"/users/{urllib.parse.quote(user_id, safe='')}/roles", body={"roles": roles}
+        )
+        return data.get("roles", [])
+
+    def add_user_role(self, user_id: str, role_slug: str) -> list[str]:
+        """Grant one role without disturbing the others (idempotent). Returns the resulting roles."""
+        path = f"/users/{urllib.parse.quote(user_id, safe='')}/roles/{urllib.parse.quote(role_slug, safe='')}"
+        return self._request("POST", path).get("roles", [])
+
+    def remove_user_role(self, user_id: str, role_slug: str) -> list[str]:
+        """Revoke one role (idempotent). Returns the resulting roles."""
+        path = f"/users/{urllib.parse.quote(user_id, safe='')}/roles/{urllib.parse.quote(role_slug, safe='')}"
+        return self._request("DELETE", path).get("roles", [])
+
+    def get_user_permissions(self, user_id: str) -> list[str]:
+        """A member's direct permission overrides (slugs), separate from role-granted ones."""
+        data = self._request("GET", f"/users/{urllib.parse.quote(user_id, safe='')}/permissions")
+        return data.get("permissions", [])
+
+    def set_user_permissions(self, user_id: str, permissions: list[str]) -> list[str]:
+        """Replace a member's direct permission overrides (full set of slugs). Returns the result."""
+        data = self._request(
+            "PUT", f"/users/{urllib.parse.quote(user_id, safe='')}/permissions", body={"permissions": permissions}
+        )
+        return data.get("permissions", [])
+
+    def get_user_auth_logs(self, user_id: str, *, page: Optional[int] = None, page_size: Optional[int] = None) -> AuthLogsPage:
+        """A member's authentication-event history for this app (newest first, paginated)."""
+        query: dict[str, Any] = {}
+        if page:
+            query["page"] = page
+        if page_size:
+            query["pageSize"] = page_size
+        data = self._request("GET", f"/users/{urllib.parse.quote(user_id, safe='')}/auth-logs", query=query)
+        return from_dict(AuthLogsPage, data)
+
+    def list_auth_logs(
+        self,
+        *,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        outcome: Optional[str] = None,
+        page: Optional[int] = None,
+        page_size: Optional[int] = None,
+    ) -> AuthLogsPage:
+        """App-wide auth-event history (all users), for SIEM/analytics ingestion.
+
+        ``since``/``until`` are RFC3339 timestamps for incremental pulls.
+        """
+        query: dict[str, Any] = {}
+        if since:
+            query["since"] = since
+        if until:
+            query["until"] = until
+        if outcome:
+            query["outcome"] = outcome
+        if page:
+            query["page"] = page
+        if page_size:
+            query["pageSize"] = page_size
+        return from_dict(AuthLogsPage, self._request("GET", "/auth-logs", query=query))
+
+    def list_webhooks(self) -> list[Webhook]:
+        """The app's webhook subscriptions (signing secrets redacted)."""
+        data = self._request("GET", "/webhooks")
+        return [from_dict(Webhook, w) for w in data.get("webhooks", [])]
+
+    def create_webhook(self, *, url: str, events: list[str], description: Optional[str] = None) -> Webhook:
+        """Register a webhook. The returned ``secret`` is shown only here — store it."""
+        body: dict[str, Any] = {"url": url, "events": events}
+        if description is not None:
+            body["description"] = description
+        return from_dict(Webhook, self._request("POST", "/webhooks", body=body))
+
+    def get_webhook(self, webhook_id: str) -> Webhook:
+        """Get one webhook (secret redacted)."""
+        return from_dict(Webhook, self._request("GET", f"/webhooks/{urllib.parse.quote(webhook_id, safe='')}"))
+
+    def update_webhook(
+        self,
+        webhook_id: str,
+        *,
+        url: Optional[str] = None,
+        events: Optional[list[str]] = None,
+        status: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Webhook:
+        """Patch a webhook (URL, events, status, description)."""
+        body: dict[str, Any] = {}
+        if url is not None:
+            body["url"] = url
+        if events is not None:
+            body["events"] = events
+        if status is not None:
+            body["status"] = status
+        if description is not None:
+            body["description"] = description
+        return from_dict(Webhook, self._request("PATCH", f"/webhooks/{urllib.parse.quote(webhook_id, safe='')}", body=body))
+
+    def delete_webhook(self, webhook_id: str) -> None:
+        """Delete a webhook."""
+        self._request("DELETE", f"/webhooks/{urllib.parse.quote(webhook_id, safe='')}")
+
+    def rotate_webhook_secret(self, webhook_id: str) -> Webhook:
+        """Issue a fresh signing secret; the returned ``secret`` is shown only here."""
+        path = f"/webhooks/{urllib.parse.quote(webhook_id, safe='')}/rotate-secret"
+        return from_dict(Webhook, self._request("POST", path))
+
+    def revoke_user_sessions(self, user_id: str) -> int:
+        """Force-logout: revoke all of a member's sessions for this app. Returns the count revoked."""
+        data = self._request("DELETE", f"/users/{urllib.parse.quote(user_id, safe='')}/sessions")
+        return data.get("revoked", 0)
+
+    def list_user_sessions(self, user_id: str) -> list[Session]:
+        """A member's active sessions for this app."""
+        data = self._request("GET", f"/users/{urllib.parse.quote(user_id, safe='')}/sessions")
+        return [from_dict(Session, s) for s in data.get("sessions", [])]
+
+    def revoke_user_session(self, user_id: str, session_id: str) -> None:
+        """Revoke a single session of a member."""
+        path = f"/users/{urllib.parse.quote(user_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}"
+        self._request("DELETE", path)
+
+    def set_user_password(self, user_id: str, password: str) -> None:
+        """Set or replace a member's password (enforced against the app's policy)."""
+        self._request("PUT", f"/users/{urllib.parse.quote(user_id, safe='')}/password", body={"password": password})
+
+    def clear_user_password(self, user_id: str) -> None:
+        """Clear a member's password (email+password sign-in disabled until a new one is set)."""
+        self._request("DELETE", f"/users/{urllib.parse.quote(user_id, safe='')}/password")
+
+    def set_user_email_verified(self, user_id: str, verified: bool) -> None:
+        """Mark a member's email verified or unverified (a pool-level attribute)."""
+        self._request(
+            "PUT", f"/users/{urllib.parse.quote(user_id, safe='')}/email-verified", body={"verified": verified}
         )
 
-    def get_user_by_email(self, email: str) -> UserResult:
-        """Look up a user by email within the app's auth scope."""
-        return _parse_user_result(
-            self._get_json(self._api_url("/users"), params={"email": email})
-        )
+    def set_user_enabled(self, user_id: str, enabled: bool) -> None:
+        """Enable/disable a user's identity pool-wide (ban). Disabling blocks all apps + revokes sessions."""
+        self._request("PUT", f"/users/{urllib.parse.quote(user_id, safe='')}/enabled", body={"enabled": enabled})
 
-    # === User Fields ===
+    def change_user_email(self, user_id: str, email: str) -> None:
+        """Change a member's email (marks it verified). Raises ManyRowsServerError 409 if taken in the pool."""
+        self._request("PUT", f"/users/{urllib.parse.quote(user_id, safe='')}/email", body={"email": email})
+
+    def create_magic_link(self, user_id: str, *, remember_me: bool = False) -> MagicLinkResult:
+        """Generate a one-time passwordless sign-in link (requires magic-link auth on the app)."""
+        data = self._request(
+            "POST", f"/users/{urllib.parse.quote(user_id, safe='')}/magic-link", body={"rememberMe": remember_me}
+        )
+        return from_dict(MagicLinkResult, data)
+
+    # ---- User fields ----
 
     def list_user_fields(self) -> list[UserField]:
-        """Returns all user field definitions for the app."""
-        data = self._get_json(self._api_url("/user-fields"))
-        items = data.get("userFields") or []
-        return [_parse_user_field(f) for f in items]
+        """The pool's user-field definitions."""
+        data = self._request("GET", "/user-fields")
+        return [from_dict(UserField, f) for f in data.get("userFields", [])]
 
+    def get_user_field_values(self, user_id: str) -> list[UserFieldValue]:
+        """A member's field values."""
+        data = self._request("GET", f"/user-fields/users/{urllib.parse.quote(user_id, safe='')}")
+        return [from_dict(UserFieldValue, v) for v in data.get("values", [])]
 
-# ===== Async Client =====
+    def set_user_field_value(self, field_id: str, user_id: str, value: Any) -> UserFieldValue:
+        """Set a member's value for a field (validated server-side against the field's type)."""
+        path = f"/user-fields/{urllib.parse.quote(field_id, safe='')}/users/{urllib.parse.quote(user_id, safe='')}"
+        data = self._request("PUT", path, body={"value": value})
+        return from_dict(UserFieldValue, data.get("value"))
 
+    def delete_user_field_value(self, field_id: str, user_id: str) -> None:
+        """Clear a member's value for a field."""
+        path = f"/user-fields/{urllib.parse.quote(field_id, safe='')}/users/{urllib.parse.quote(user_id, safe='')}"
+        self._request("DELETE", path)
 
-class AsyncClient:
-    """Asynchronous client for the ManyRows Server API.
+    def set_config_value(self, config_key: str, value: Any) -> Any:
+        """Set this app's value for a public/private config key; returns the stored value."""
+        data = self._request("PUT", f"/config/{urllib.parse.quote(config_key, safe='')}", body={"value": value})
+        return data.get("value")
 
-    Construct once and reuse. Supports use as an async context manager:
+    def get_config_value(self, config_key: str) -> Any:
+        """Read this app's value for a config key (raises 404 if unset; secret keys raise 400)."""
+        return self._request("GET", f"/config/{urllib.parse.quote(config_key, safe='')}").get("value")
 
-        async with AsyncClient(...) as c:
-            user = await c.get_user("u_1")
-    """
+    def get_feature_flag_override(self, flag_key: str) -> FeatureFlagOverride:
+        """Read this app's override for a feature flag (raises 404 if no override set)."""
+        path = f"/features/{urllib.parse.quote(flag_key, safe='')}"
+        return from_dict(FeatureFlagOverride, self._request("GET", path))
 
-    def __init__(
+    def delete_config_value(self, config_key: str) -> None:
+        """Clear this app's value for a config key."""
+        self._request("DELETE", f"/config/{urllib.parse.quote(config_key, safe='')}")
+
+    def set_feature_flag_override(
+        self, flag_key: str, enabled: bool, roles: Optional[list[str]] = None
+    ) -> FeatureFlagOverride:
+        """Set this app's feature-flag override (optionally targeting role slugs); returns the override."""
+        body: dict[str, Any] = {"enabled": enabled}
+        if roles is not None:
+            body["roles"] = roles
+        data = self._request("PUT", f"/features/{urllib.parse.quote(flag_key, safe='')}", body=body)
+        return from_dict(FeatureFlagOverride, data)
+
+    def clear_feature_flag_override(self, flag_key: str) -> None:
+        """Clear this app's feature-flag override (falls back to the flag's default)."""
+        self._request("DELETE", f"/features/{urllib.parse.quote(flag_key, safe='')}")
+
+    # ---- config-key & feature-flag DEFINITIONS (the schema; values/overrides above) ----
+
+    def create_config_key(self, *, key: str, exposure: str, value_type: str, description: Optional[str] = None) -> ConfigKey:
+        """Define a config key (exposure: public|private|secret; value_type: string|int|bool|...)."""
+        body: dict[str, Any] = {"key": key, "exposure": exposure, "valueType": value_type}
+        if description is not None:
+            body["description"] = description
+        return from_dict(ConfigKey, self._request("POST", "/config-keys", body=body))
+
+    def update_config_key(
         self,
-        base_url: str,
-        workspace_slug: str,
-        app_id: str,
-        api_key: str,
+        key: str,
         *,
-        http_client: httpx.AsyncClient | None = None,
-    ):
-        _validate_opts(base_url, workspace_slug, app_id, api_key)
+        description: Optional[str] = None,
+        exposure: Optional[str] = None,
+        value_type: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> ConfigKey:
+        """Update a config key's metadata (omit a field to leave it unchanged)."""
+        body: dict[str, Any] = {}
+        if description is not None:
+            body["description"] = description
+        if exposure is not None:
+            body["exposure"] = exposure
+        if value_type is not None:
+            body["valueType"] = value_type
+        if status is not None:
+            body["status"] = status
+        return from_dict(ConfigKey, self._request("PATCH", f"/config-keys/{urllib.parse.quote(key, safe='')}", body=body))
 
-        self._base_url = _strip_trailing_slashes(base_url)
-        self._workspace_slug = workspace_slug
-        self._app_id = app_id
-        self._api_key = api_key
-        self._owns_http = http_client is None
-        self._http = (
-            http_client if http_client is not None else httpx.AsyncClient(timeout=10.0)
-        )
+    def delete_config_key(self, key: str) -> None:
+        """Delete a config key and its per-app values."""
+        self._request("DELETE", f"/config-keys/{urllib.parse.quote(key, safe='')}")
 
-    def _api_url(self, path: str) -> str:
-        return (
-            f"{self._base_url}/x/{self._workspace_slug}/api/apps/{self._app_id}{path}"
-        )
+    def create_feature_flag(self, *, key: str, scope: str, default_enabled: bool = False, description: Optional[str] = None) -> FeatureFlag:
+        """Define a feature flag (scope: server|client)."""
+        body: dict[str, Any] = {"key": key, "scope": scope, "defaultEnabled": default_enabled}
+        if description is not None:
+            body["description"] = description
+        return from_dict(FeatureFlag, self._request("POST", "/feature-flags", body=body))
 
-    async def _get_json(
-        self, url: str, params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        try:
-            res = await self._http.get(
-                url,
-                params=params,
-                headers={"X-API-Key": self._api_key, "User-Agent": _USER_AGENT},
-            )
-        except httpx.HTTPError as exc:
-            raise ManyRowsError(f"manyrows: request failed: {exc}") from exc
-
-        _raise_for_status(res)
-
-        try:
-            data = res.json()
-        except ValueError as exc:
-            raise ManyRowsError(f"manyrows: failed to decode response: {exc}") from exc
-
-        if not isinstance(data, dict):
-            raise ManyRowsError("manyrows: unexpected response shape (not an object)")
-        return data
-
-    # === Lifecycle ===
-
-    async def aclose(self) -> None:
-        if self._owns_http:
-            await self._http.aclose()
-
-    async def __aenter__(self) -> AsyncClient:
-        return self
-
-    async def __aexit__(
+    def update_feature_flag(
         self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        await self.aclose()
+        key: str,
+        *,
+        description: Optional[str] = None,
+        scope: Optional[str] = None,
+        default_enabled: Optional[bool] = None,
+        status: Optional[str] = None,
+    ) -> FeatureFlag:
+        """Update a feature flag's metadata (omit a field to leave it unchanged)."""
+        body: dict[str, Any] = {}
+        if description is not None:
+            body["description"] = description
+        if scope is not None:
+            body["scope"] = scope
+        if default_enabled is not None:
+            body["defaultEnabled"] = default_enabled
+        if status is not None:
+            body["status"] = status
+        return from_dict(FeatureFlag, self._request("PATCH", f"/feature-flags/{urllib.parse.quote(key, safe='')}", body=body))
 
-    # === Delivery ===
+    def delete_feature_flag(self, key: str) -> None:
+        """Delete a feature flag and its per-app overrides."""
+        self._request("DELETE", f"/feature-flags/{urllib.parse.quote(key, safe='')}")
 
-    async def get_delivery(self) -> Delivery:
-        return _parse_delivery(await self._get_json(self._api_url("/")))
+    def list_config_keys(self) -> list[ConfigKey]:
+        """The product's config-key definitions."""
+        data = self._request("GET", "/config-keys")
+        return [from_dict(ConfigKey, c) for c in data.get("configKeys", [])]
 
-    # === Permissions ===
+    def get_config_key(self, key: str) -> ConfigKey:
+        """Fetch one config-key definition by key."""
+        return from_dict(ConfigKey, self._request("GET", f"/config-keys/{urllib.parse.quote(key, safe='')}"))
 
-    async def check_permission(self, account_id: str, permission: str) -> PermissionResult:
-        return _parse_permission_result(
-            await self._get_json(
-                self._api_url("/check-permission"),
-                params={"accountId": account_id, "permission": permission},
-            )
-        )
+    def list_feature_flags(self) -> list[FeatureFlag]:
+        """The product's feature-flag definitions."""
+        data = self._request("GET", "/feature-flags")
+        return [from_dict(FeatureFlag, f) for f in data.get("featureFlags", [])]
 
-    async def has_permission(self, account_id: str, permission: str) -> bool:
-        r = await self.check_permission(account_id, permission)
-        return r.allowed
+    def get_feature_flag(self, key: str) -> FeatureFlag:
+        """Fetch one feature-flag definition by key."""
+        return from_dict(FeatureFlag, self._request("GET", f"/feature-flags/{urllib.parse.quote(key, safe='')}"))
 
-    # === Members ===
+    def reset_user_totp(self, user_id: str) -> None:
+        """Reset (disable) a member's 2FA — for a user who lost their authenticator."""
+        self._request("DELETE", f"/users/{urllib.parse.quote(user_id, safe='')}/totp")
 
-    async def list_members(
-        self,
-        page: int = 0,
-        page_size: int = 50,
-        email: str | None = None,
-    ) -> MembersResult:
-        params: dict[str, Any] = {"page": page, "pageSize": page_size}
-        if email:
-            params["email"] = email
-        return _parse_members_result(
-            await self._get_json(self._api_url("/members"), params=params)
-        )
+    def unlock_user(self, user_id: str) -> None:
+        """Clear a failed-login lockout on a member."""
+        self._request("POST", f"/users/{urllib.parse.quote(user_id, safe='')}/unlock")
 
-    async def list_members_by_email(
-        self, email: str, page: int = 0, page_size: int = 50
-    ) -> MembersResult:
-        return await self.list_members(page=page, page_size=page_size, email=email)
+    def list_user_identities(self, user_id: str) -> list[Identity]:
+        """A member's linked SSO/OAuth identities."""
+        data = self._request("GET", f"/users/{urllib.parse.quote(user_id, safe='')}/identities")
+        return [from_dict(Identity, i) for i in data.get("identities", [])]
 
-    # === Users ===
+    def delete_user_identity(self, user_id: str, provider: str) -> None:
+        """Unlink a member's SSO identity for a provider (e.g. 'google')."""
+        path = f"/users/{urllib.parse.quote(user_id, safe='')}/identities/{urllib.parse.quote(provider, safe='')}"
+        self._request("DELETE", path)
 
-    async def get_user(self, user_id: str) -> UserResult:
-        return _parse_user_result(
-            await self._get_json(self._api_url("/users"), params={"id": user_id})
-        )
+    def list_user_passkeys(self, user_id: str) -> list[Passkey]:
+        """A member's passkeys (WebAuthn credentials) for this app."""
+        data = self._request("GET", f"/users/{urllib.parse.quote(user_id, safe='')}/passkeys")
+        return [from_dict(Passkey, p) for p in data.get("passkeys", [])]
 
-    async def get_user_by_email(self, email: str) -> UserResult:
-        return _parse_user_result(
-            await self._get_json(self._api_url("/users"), params={"email": email})
-        )
+    def delete_user_passkey(self, user_id: str, passkey_id: str) -> None:
+        """Remove one of a member's passkeys."""
+        path = f"/users/{urllib.parse.quote(user_id, safe='')}/passkeys/{urllib.parse.quote(passkey_id, safe='')}"
+        self._request("DELETE", path)
 
-    # === User Fields ===
+    # ---- internal ----
 
-    async def list_user_fields(self) -> list[UserField]:
-        data = await self._get_json(self._api_url("/user-fields"))
-        items = data.get("userFields") or []
-        return [_parse_user_field(f) for f in items]
+    def _request(
+        self, method: str, path: str, *, query: Optional[dict] = None, body: Optional[Any] = None
+    ) -> Any:
+        url = self._base + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+
+        data: Optional[bytes] = None
+        headers = {"X-API-Key": self._api_key, "Accept": "application/json"}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as res:
+                raw = res.read()
+                if res.status == 204 or not raw:
+                    return {}
+                return json.loads(raw)
+        except urllib.error.HTTPError as err:
+            code = f"http_{err.code}"
+            message = err.reason or ""
+            try:
+                parsed = json.loads(err.read())
+                code = parsed.get("error", code)
+                message = parsed.get("message", message)
+            except (ValueError, OSError):
+                pass
+            raise ManyRowsServerError(err.code, code, message) from None
