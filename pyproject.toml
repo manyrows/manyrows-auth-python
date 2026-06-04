@@ -30,8 +30,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://manyrows.com"
-Repository = "https://github.com/manyrows/manyrows-python"
-Issues = "https://github.com/manyrows/manyrows-python/issues"
+Repository = "https://github.com/manyrows/manyrows-auth-python"
+Issues = "https://github.com/manyrows/manyrows-auth-python/issues"
 
 [project.optional-dependencies]
 secrets = ["cryptography>=41"]

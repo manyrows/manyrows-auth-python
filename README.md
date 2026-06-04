@@ -12,19 +12,19 @@ domain in production).
 This SDK is **not yet on PyPI**. Install directly from GitHub:
 
 ```bash
-pip install git+https://github.com/manyrows/manyrows-python.git
+pip install git+https://github.com/manyrows/manyrows-auth-python.git
 ```
 
 To pin to a specific commit or tag:
 
 ```bash
-pip install git+https://github.com/manyrows/manyrows-python.git@<commit-or-tag>
+pip install git+https://github.com/manyrows/manyrows-auth-python.git@<commit-or-tag>
 ```
 
 If you need to decrypt secrets (see below), pull the optional extra:
 
 ```bash
-pip install 'manyrows[secrets] @ git+https://github.com/manyrows/manyrows-python.git'
+pip install 'manyrows[secrets] @ git+https://github.com/manyrows/manyrows-auth-python.git'
 ```
 
 Requires **Python 3.9+**. Sync and async clients are both included; both use [`httpx`](https://www.python-httpx.org/) under the hood.
