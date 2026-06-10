@@ -10,6 +10,10 @@ from typing import Any, Optional
 
 from .models import (
     CheckPermissionResult,
+    Organization,
+    OrgInvite,
+    OrgMember,
+    OrgMembership,
     CreateUserResult,
     Delivery,
     MagicLinkResult,
@@ -33,6 +37,14 @@ from .models import (
     from_dict,
 )
 
+#: SDK version, sent as the User-Agent on every request so the server (and any
+#: proxy/WAF in front of it) can identify the client rather than treating it as
+#: an anonymous bot. Keep in sync with ``pyproject.toml``.
+VERSION = "1.0.0"
+
+# Sent on every request.
+_USER_AGENT = f"manyrows-auth-python/{VERSION}"
+
 
 class ManyRowsServerError(Exception):
     """Raised for any non-2xx response; carries the HTTP status and error code."""
@@ -42,6 +54,19 @@ class ManyRowsServerError(Exception):
         self.status = status
         self.code = code
         self.message = message or code
+
+
+# Stable API error codes (the ``code`` attribute of :class:`ManyRowsServerError`)
+# for the org endpoints.
+CODE_USER_NOT_SIGNED_IN = "error.userNotSignedIn"
+CODE_INVITE_PENDING = "error.invitePending"
+CODE_CONFLICT = "error.conflict"
+CODE_NOT_FOUND = "error.notFound"
+
+
+def is_code(err: BaseException, code: str) -> bool:
+    """Whether ``err`` is a :class:`ManyRowsServerError` carrying the given API code."""
+    return isinstance(err, ManyRowsServerError) and err.code == code
 
 
 class ManyRowsServer:
@@ -93,6 +118,10 @@ class ManyRowsServer:
         """Whether a member has a permission in this app."""
         data = self._request("GET", "/check-permission", query={"accountId": user_id, "permission": permission})
         return from_dict(CheckPermissionResult, data)
+
+    def has_permission(self, user_id: str, permission: str) -> bool:
+        """Whether a member has a permission in this app, as a bare boolean."""
+        return self.check_permission(user_id, permission).allowed
 
     def list_roles(self) -> list[RoleSummary]:
         """The product's roles, each with the permission slugs it grants."""
@@ -539,6 +568,111 @@ class ManyRowsServer:
         path = f"/users/{urllib.parse.quote(user_id, safe='')}/passkeys/{urllib.parse.quote(passkey_id, safe='')}"
         self._request("DELETE", path)
 
+    # ---- Organizations ----
+
+    def create_organization(self, *, name: str, owner_user_id: str, slug: Optional[str] = None) -> Organization:
+        """Create an organization with the given end-user as its initial owner."""
+        body: dict[str, Any] = {"name": name, "ownerUserId": owner_user_id}
+        if slug:
+            body["slug"] = slug
+        return from_dict(Organization, self._request("POST", "/organizations", body=body))
+
+    def list_organizations_for_user(self, user_id: str) -> list[OrgMembership]:
+        """The organizations a user belongs to, each with their tier."""
+        data = self._request("GET", "/organizations", query={"userId": user_id})
+        return [from_dict(OrgMembership, o) for o in data.get("organizations", [])]
+
+    def get_organization(self, org_id: str) -> Organization:
+        """Fetch one organization by id."""
+        return from_dict(Organization, self._request("GET", f"/organizations/{urllib.parse.quote(org_id, safe='')}"))
+
+    def update_organization(
+        self, org_id: str, *, name: Optional[str] = None, slug: Optional[str] = None
+    ) -> Organization:
+        """Update an organization's name and/or slug (omit a field to leave it unchanged)."""
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if slug is not None:
+            body["slug"] = slug
+        data = self._request("PATCH", f"/organizations/{urllib.parse.quote(org_id, safe='')}", body=body)
+        return from_dict(Organization, data)
+
+    def delete_organization(self, org_id: str, actor_user_id: str) -> None:
+        """Hard-delete an org. The auth server enforces owner-only deletion:
+        ``actor_user_id`` names the acting end-user, who must be an active owner
+        of the org, or the call is rejected (400 if empty, 403 if not an owner)."""
+        path = f"/organizations/{urllib.parse.quote(org_id, safe='')}"
+        self._request("DELETE", path, query={"actorUserId": actor_user_id})
+
+    # ---- Organization members ----
+
+    def list_organization_members(self, org_id: str) -> list[OrgMember]:
+        """An organization's members."""
+        data = self._request("GET", f"/organizations/{urllib.parse.quote(org_id, safe='')}/members")
+        return [from_dict(OrgMember, m) for m in data.get("members", [])]
+
+    def get_organization_member(self, org_id: str, user_id: str) -> OrgMember:
+        """Fetch one organization member by user id."""
+        path = f"/organizations/{urllib.parse.quote(org_id, safe='')}/members/{urllib.parse.quote(user_id, safe='')}"
+        return from_dict(OrgMember, self._request("GET", path))
+
+    def add_organization_member(
+        self, org_id: str, *, org_role: str, user_id: Optional[str] = None, email: Optional[str] = None
+    ) -> OrgMember:
+        """Add a member by ``user_id`` or ``email``. Raises ``error.userNotSignedIn``
+        (409) when adding by email and the user has never signed in to the app."""
+        body: dict[str, Any] = {"orgRole": org_role}
+        if user_id:
+            body["userId"] = user_id
+        if email:
+            body["email"] = email
+        data = self._request("POST", f"/organizations/{urllib.parse.quote(org_id, safe='')}/members", body=body)
+        return from_dict(OrgMember, data)
+
+    def set_organization_member_role(self, org_id: str, user_id: str, org_role: str) -> None:
+        """Change a member's org tier. Raises ``error.conflict`` (409) when demoting the last owner."""
+        path = f"/organizations/{urllib.parse.quote(org_id, safe='')}/members/{urllib.parse.quote(user_id, safe='')}"
+        self._request("PATCH", path, body={"orgRole": org_role})
+
+    def remove_organization_member(self, org_id: str, user_id: str) -> None:
+        """Remove a member. Raises ``error.conflict`` (409) when removing the last owner."""
+        path = f"/organizations/{urllib.parse.quote(org_id, safe='')}/members/{urllib.parse.quote(user_id, safe='')}"
+        self._request("DELETE", path)
+
+    # ---- Organization invites ----
+
+    def create_organization_invite(
+        self,
+        org_id: str,
+        *,
+        email: str,
+        org_role: Optional[str] = None,
+        role_ids: Optional[list[str]] = None,
+        invited_by_user_id: Optional[str] = None,
+    ) -> OrgInvite:
+        """Invite someone to an org by email. Raises ``error.invitePending`` (409)
+        if an invite for that email is already pending."""
+        body: dict[str, Any] = {"email": email}
+        if org_role:
+            body["orgRole"] = org_role
+        if role_ids:
+            body["roleIds"] = role_ids
+        if invited_by_user_id:
+            body["invitedByUserId"] = invited_by_user_id
+        data = self._request("POST", f"/organizations/{urllib.parse.quote(org_id, safe='')}/invites", body=body)
+        return from_dict(OrgInvite, data)
+
+    def list_organization_invites(self, org_id: str) -> list[OrgInvite]:
+        """An organization's pending invites."""
+        data = self._request("GET", f"/organizations/{urllib.parse.quote(org_id, safe='')}/invites")
+        return [from_dict(OrgInvite, i) for i in data.get("invites", [])]
+
+    def revoke_organization_invite(self, org_id: str, invite_id: str) -> None:
+        """Revoke a pending invite."""
+        path = f"/organizations/{urllib.parse.quote(org_id, safe='')}/invites/{urllib.parse.quote(invite_id, safe='')}"
+        self._request("DELETE", path)
+
     # ---- internal ----
 
     def _request(
@@ -549,7 +683,7 @@ class ManyRowsServer:
             url += "?" + urllib.parse.urlencode(query)
 
         data: Optional[bytes] = None
-        headers = {"X-API-Key": self._api_key, "Accept": "application/json"}
+        headers = {"X-API-Key": self._api_key, "Accept": "application/json", "User-Agent": _USER_AGENT}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"

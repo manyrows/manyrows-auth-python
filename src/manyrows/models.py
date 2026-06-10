@@ -67,6 +67,52 @@ class MembersList:
 
 
 @dataclass
+class Organization:
+    """An app-scoped tenant."""
+
+    id: str = ""
+    app_id: str = ""
+    name: str = ""
+    slug: str = ""
+    status: str = ""
+    created_at: str = ""
+
+
+@dataclass
+class OrgMembership:
+    """One of a user's organizations + their tier (``list_organizations_for_user``)."""
+
+    id: str = ""
+    name: str = ""
+    slug: str = ""
+    org_role: str = ""
+
+
+@dataclass
+class OrgMember:
+    """A member of an organization. ``email`` is populated by the member
+    list/add responses; the lightweight membership gate omits it."""
+
+    user_id: str = ""
+    email: str = ""
+    org_role: str = ""
+    status: str = ""
+
+
+@dataclass
+class OrgInvite:
+    """A pending organization invitation."""
+
+    id: str = ""
+    email: str = ""
+    org_role: str = ""
+    status: str = ""
+    invited_by_email: Optional[str] = None
+    created_at: str = ""
+    expires_at: str = ""
+
+
+@dataclass
 class CheckPermissionResult:
     allowed: bool = False
     permission: str = ""

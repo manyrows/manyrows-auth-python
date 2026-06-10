@@ -11,7 +11,16 @@ Surfaces three things:
 """
 
 from manyrows.auth import bearer_token, mr_at_cookie, verify_token, verify_token_async
-from manyrows.client import ManyRowsServer, ManyRowsServerError
+from manyrows.client import (
+    CODE_CONFLICT,
+    CODE_INVITE_PENDING,
+    CODE_NOT_FOUND,
+    CODE_USER_NOT_SIGNED_IN,
+    VERSION,
+    ManyRowsServer,
+    ManyRowsServerError,
+    is_code,
+)
 from manyrows.models import (
     AuthLogEntry,
     AuthLogsPage,
@@ -30,6 +39,10 @@ from manyrows.models import (
     MagicLinkResult,
     Member,
     MembersList,
+    Organization,
+    OrgInvite,
+    OrgMember,
+    OrgMembership,
     Passkey,
     PermissionSummary,
     RemoveUserResult,
@@ -45,12 +58,19 @@ from manyrows.models import (
 from manyrows.secrets import SecretsError, compute_public_jwk_fingerprint, decrypt_secret
 from manyrows.webhook import WebhookError, verify_webhook
 
-__version__ = "1.0.0"
+__version__ = VERSION
 
 __all__ = [
     # Server-to-server client
     "ManyRowsServer",
     "ManyRowsServerError",
+    "VERSION",
+    # Stable API error codes for the org endpoints
+    "CODE_CONFLICT",
+    "CODE_INVITE_PENDING",
+    "CODE_NOT_FOUND",
+    "CODE_USER_NOT_SIGNED_IN",
+    "is_code",
     # Models
     "AuthLogEntry",
     "AuthLogsPage",
@@ -69,6 +89,10 @@ __all__ = [
     "MagicLinkResult",
     "Member",
     "MembersList",
+    "Organization",
+    "OrgInvite",
+    "OrgMember",
+    "OrgMembership",
     "Passkey",
     "PermissionSummary",
     "RemoveUserResult",
